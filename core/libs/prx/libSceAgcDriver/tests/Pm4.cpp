@@ -16,6 +16,9 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -356,6 +359,59 @@ void testIndirectDraw() {
     expectFailure([&] { AgcDriver::Pm4::ReadDrawCount(*local.indirect); }, "count address");
 }
 
+void testIndirectDrawReadableIndexPrefix() {
+    constexpr std::size_t PageBytes = 0x10000;
+    constexpr std::size_t ReservedBytes = 4 * PageBytes;
+    constexpr std::size_t ReadableBytes = 2 * PageBytes;
+#ifdef _WIN32
+    auto* memory = static_cast<std::byte*>(VirtualAlloc(nullptr, ReservedBytes, MEM_RESERVE, PAGE_NOACCESS));
+    check(memory != nullptr && VirtualAlloc(memory, ReadableBytes, MEM_COMMIT, PAGE_READWRITE) == memory, "cannot map the index pages");
+#else
+    const auto block = mmap(nullptr, ReservedBytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(block != MAP_FAILED, "cannot reserve the index pages");
+    auto* memory = static_cast<std::byte*>(block);
+    check(mprotect(memory, ReadableBytes, PROT_READ | PROT_WRITE) == 0, "cannot map the index pages");
+#endif
+    struct Release {
+        std::byte* memory;
+        ~Release() {
+#ifdef _WIN32
+            VirtualFree(memory, 0, MEM_RELEASE);
+#else
+            munmap(memory, ReservedBytes);
+#endif
+        }
+    } release{memory};
+    const auto base = reinterpret_cast<std::uintptr_t>(memory);
+    alignas(16) std::array<std::uint32_t, 10> records{};
+    AgcDriver::QueueState state;
+    state.drawIndirectBase = reinterpret_cast<std::uintptr_t>(records.data());
+    state.indexBase = base;
+    state.indexType = 0;
+    state.indexBufferSize = ReservedBytes / 2;
+    const auto multi = makePacket(0x38, {0, 0x280, 0x8e, 0x280, 2, 0, 0, 20, 0});
+    const auto single = makePacket(0x25, {0, 0x8c, 0x280, 0});
+    const auto declaredPastMapping = AgcDriver::Pm4::ResolveDraw(multi, state);
+    check(declaredPastMapping.indexed && declaredPastMapping.indexAddress == base && declaredPastMapping.indexSize == 2 && declaredPastMapping.indexCount == ReadableBytes / 2 && declaredPastMapping.indirect->count == 2, "an indexed indirect draw did not bind the readable part of INDEX_BUFFER_SIZE");
+    check(AgcDriver::Pm4::ResolveDraw(single, state).indexCount == ReadableBytes / 2, "an indexed indirect draw did not bind the readable part of INDEX_BUFFER_SIZE");
+    state.indexBufferSize = 0xffffffffu;
+    check(AgcDriver::Pm4::ResolveDraw(multi, state).indexCount == ReadableBytes / 2, "a maximal INDEX_BUFFER_SIZE did not bind the readable part");
+    state.indexBufferSize = 3;
+    check(AgcDriver::Pm4::ResolveDraw(multi, state).indexCount == 3, "an indexed indirect draw inside readable memory changed INDEX_BUFFER_SIZE");
+    state.indexBufferSize = ReadableBytes / 2;
+    check(AgcDriver::Pm4::ResolveDraw(multi, state).indexCount == ReadableBytes / 2, "an indexed indirect draw ending at the mapping changed INDEX_BUFFER_SIZE");
+    state.indexBase = base + PageBytes + 4;
+    state.indexType = 1;
+    state.indexBufferSize = PageBytes;
+    const auto offsetBase = AgcDriver::Pm4::ResolveDraw(multi, state);
+    check(offsetBase.indexAddress == base + PageBytes + 4 && offsetBase.indexSize == 4 && offsetBase.indexCount == (PageBytes - 4) / 4, "a 32-bit indexed indirect draw did not bind the readable part of INDEX_BUFFER_SIZE");
+    state.indexBase = base + ReadableBytes;
+    state.indexType = 0;
+    expectFailure([&] { AgcDriver::Pm4::ResolveDraw(multi, state); }, "guest memory is not readable");
+    state.indexBase = base + ReadableBytes - 2;
+    check(AgcDriver::Pm4::ResolveDraw(multi, state).indexCount == 1, "the last readable index was not bound");
+}
+
 bool sameDraw(const AgcDriver::Pm4::DrawParameters& left, const AgcDriver::Pm4::DrawParameters& right) {
     return left.indexAddress == right.indexAddress && left.indexCount == right.indexCount && left.indexSize == right.indexSize && left.instanceCount == right.instanceCount &&
         left.flags == right.flags && left.indexed == right.indexed && left.firstVertex == right.firstVertex && left.indirect.has_value() == right.indirect.has_value();
@@ -394,7 +450,8 @@ void testIndexAttributesIndirect() {
     check(sameDraw(indirectFromRecord, AgcDriver::Pm4::ResolveDraw(indirectDraw, direct)) && indirectFromRecord.indexAddress == indexAddress && indirectFromRecord.indexCount == 12 && indirectFromRecord.indexSize == 4, "an indexed indirect draw after INDEX_ATTRIBUTES_INDIRECT differs from the same draw after the direct packets");
     records[6] = 0x7fffffffu;
     execute(loaded, packet);
-    expectFailure([&] { AgcDriver::Pm4::ResolveDraw(indirectDraw, loaded); }, "guest");
+    const auto clamped = AgcDriver::Pm4::ResolveDraw(indirectDraw, loaded);
+    check(clamped.indexAddress == indexAddress && clamped.indexCount >= 12 && clamped.indexCount < 0x7fffffffu, "an indexed indirect draw after INDEX_ATTRIBUTES_INDIRECT did not bind the readable part of its INDEX_BUFFER_SIZE");
     records[6] = 12;
 
     static std::size_t flushed = 0;
@@ -1278,6 +1335,7 @@ int main(int argc, char** argv) {
         testIndexedDraw();
         testAutoDraw();
         testIndirectDraw();
+        testIndirectDrawReadableIndexPrefix();
         testIndexAttributesIndirect();
         testMemory();
         testTraceRegisterWrites();
